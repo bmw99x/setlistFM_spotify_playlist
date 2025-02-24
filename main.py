@@ -1,86 +1,223 @@
+from typing import List, Optional
+import argparse
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+import logging
+from urllib.parse import urlparse
+
 import requests
 import spotipy
 from bs4 import BeautifulSoup
 from spotipy.oauth2 import SpotifyOAuth
 
-# Must set the following environment variables
-# SPOTIPY_CLIENT_ID
-# SPOTIPY_CLIENT_SECRET
-# SPOTIPY_REDIRECT_URI
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
 MODIFY_PRIVATE_SCOPE = "playlist-modify-private"
+MODIFY_PUBLIC_SCOPE = "playlist-modify-public"
 
+@dataclass
+class SetlistConfig:
+    public: bool
+    verbose: bool
+    input_file: Optional[Path]
 
-sp = spotipy.Spotify(auth_manager=SpotifyOAuth(scope=MODIFY_PRIVATE_SCOPE))
+class SetlistError(Exception):
+    """Base exception for setlist processing errors"""
 
-def get_song_link(artist: str, song: str) -> str | None:
-    try:
-        results = sp.search(q=f"artist:{artist} track:{song}", type="track")
-        return results["tracks"]["items"][0]["external_urls"]["spotify"]
-    except IndexError:
-        return None
+class SetlistConverter:
+    def __init__(self, config: SetlistConfig):
+        self.config = config
+        scope = MODIFY_PUBLIC_SCOPE if config.public else MODIFY_PRIVATE_SCOPE
+        
+        try:
+            self.sp = spotipy.Spotify(auth_manager=SpotifyOAuth(scope=scope))
+        except Exception as e:
+            raise SetlistError(f"Failed to initialize Spotify client: {e}")
+        
+        if config.verbose:
+            logging.getLogger().setLevel(logging.DEBUG)
 
-def slug_to_plain(text: str) -> str:
-    return text.replace("-", " ")
+    def validate_setlist_url(self, url: str) -> bool:
+        """Validate that the URL is a setlist.fm setlist URL"""
+        try:
+            parsed = urlparse(url)
+            return (
+                parsed.netloc == "www.setlist.fm" 
+                and "/setlist/" in parsed.path
+            )
+        except Exception:
+            return False
 
-def get_song_labels(souped: BeautifulSoup) -> list[str]:
-    songs_list = souped.find_all("ol", class_="songsList")
-    labels = songs_list[0].find_all("a", class_="songLabel")
-    return "\n".join((label.text.replace("\n", "") for label in labels if label.text.replace("\n", "")))
+    def get_song_link(self, artist: str, song: str) -> Optional[str]:
+        """Get Spotify URL for a song"""
+        try:
+            results = self.sp.search(q=f"artist:{artist} track:{song}", type="track")
+            return results["tracks"]["items"][0]["external_urls"]["spotify"]
+        except IndexError:
+            logger.warning(f"Could not find song: {artist} - {song}")
+            return None
+        except Exception as e:
+            logger.error(f"Error searching for song: {e}")
+            return None
 
-def get_date_of_setlist(souped: BeautifulSoup) -> str:
-    """Div dateBlockContainer > div dateBlock: month, day, year"""
-    content = souped.find("div", class_="dateBlockContainer").find("div", class_="dateBlock").text
-    return content.replace("\n", " ").strip()
+    @staticmethod
+    def slug_to_plain(text: str) -> str:
+        """Convert URL slug to plain text"""
+        return text.replace("-", " ")
 
+    @staticmethod
+    def get_song_labels(souped: BeautifulSoup) -> List[str]:
+        """Extract song names from setlist page"""
+        try:
+            songs_list = souped.find_all("ol", class_="songsList")
+            labels = songs_list[0].find_all("a", class_="songLabel")
+            return [label.text.strip() for label in labels if label.text.strip()]
+        except Exception as e:
+            raise SetlistError(f"Failed to extract song labels: {e}")
 
-def create_playlist(
-    playlist_name: str,
-    playlist_public: bool = False,
-) -> str:
-    playlist = sp.user_playlist_create(
-        sp.current_user()["id"],
-        playlist_name,
-        public=playlist_public,
-        description="",
+    @staticmethod
+    def get_date_of_setlist(souped: BeautifulSoup) -> str:
+        """Extract date from setlist page"""
+        try:
+            content = souped.find("div", class_="dateBlockContainer").find("div", class_="dateBlock").text
+            return content.replace("\n", " ").strip()
+        except Exception as e:
+            raise SetlistError(f"Failed to extract setlist date: {e}")
+
+    def create_playlist(self, playlist_name: str) -> str:
+        """Create a new Spotify playlist"""
+        try:
+            playlist = self.sp.user_playlist_create(
+                self.sp.current_user()["id"],
+                playlist_name,
+                public=self.config.public,
+                description="Created by Setlist.fm converter",
+            )
+            return playlist["id"]
+        except Exception as e:
+            raise SetlistError(f"Failed to create playlist: {e}")
+
+    def add_songs_to_playlist(self, playlist_id: str, song_links: List[str]) -> None:
+        """Add songs to a Spotify playlist"""
+        try:
+            self.sp.playlist_add_items(playlist_id, song_links)
+            logger.info(f"Added {len(song_links)} songs to playlist")
+        except Exception as e:
+            raise SetlistError(f"Failed to add songs to playlist: {e}")
+
+    @staticmethod
+    def is_empty_setlist(souped: BeautifulSoup) -> bool:
+        """Check if setlist is empty"""
+        return bool(souped.find("div", class_="emptySetlist"))
+
+    @staticmethod
+    def get_venue(souped: BeautifulSoup) -> str:
+        """Extract venue from setlist page"""
+        try:
+            return souped.select_one(".setlistHeadline a[href*='/venue/']").text.strip()
+        except Exception as e:
+            raise SetlistError(f"Failed to extract venue: {e}")
+
+    def process_setlist(self, url: str) -> None:
+        """Process a single setlist URL"""
+        if not self.validate_setlist_url(url):
+            logger.error(f"Invalid setlist URL: {url}")
+            return
+
+        try:
+            artist = self.slug_to_plain(url.split("setlist.fm/setlist/")[1].split("/")[0])
+            response = requests.get(url)
+            response.raise_for_status()
+            
+            souped = BeautifulSoup(response.content, "html.parser")
+            setlist_date = self.get_date_of_setlist(souped)
+            venue = self.get_venue(souped)
+            
+            logger.info(f"Processing setlist for {artist} at {venue} on {setlist_date}")
+            
+            if self.is_empty_setlist(souped):
+                logger.warning("Setlist is empty, skipping...")
+                return
+                
+            song_labels = self.get_song_labels(souped)
+            song_links = [
+                link for link in (
+                    self.get_song_link(artist, label) 
+                    for label in song_labels
+                ) 
+                if link is not None
+            ]
+            
+            if not song_links:
+                logger.warning("No songs found on Spotify, skipping playlist creation")
+                return
+                
+            playlist_name = f"{artist} - {setlist_date} - {venue}".title()
+            playlist_id = self.create_playlist(playlist_name)
+            self.add_songs_to_playlist(playlist_id, song_links)
+            logger.info(f"Created playlist: {playlist_name}")
+            
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to fetch setlist: {e}")
+        except SetlistError as e:
+            logger.error(f"Error processing setlist: {e}")
+        except Exception as e:
+            logger.error(f"Unexpected error: {e}")
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Convert Setlist.fm setlists to Spotify playlists"
     )
-    return playlist["id"]
+    parser.add_argument(
+        "urls",
+        nargs="*",
+        help="Setlist.fm URLs to convert"
+    )
+    parser.add_argument(
+        "-f", "--file",
+        type=Path,
+        help="File containing setlist URLs (one per line)"
+    )
+    parser.add_argument(
+        "-p", "--public",
+        action="store_true",
+        help="Create public playlists (default: private)"
+    )
+    parser.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help="Enable verbose logging"
+    )
 
-def add_songs_to_playlist(playlist_id: str, song_links: list[str]):
-    sp.playlist_add_items(playlist_id, song_links)
-    print("Added songs to playlist")
+    args = parser.parse_args()
 
-def is_empty_setlist(souped: BeautifulSoup) -> bool:
-    """EmptySetlist class will be present if the setlist is empty"""
-    return bool(souped.find("div", class_="emptySetlist"))
+    if not args.urls and not args.file:
+        parser.error("Please provide either URLs or an input file")
 
-def get_venue(souped: BeautifulSoup) -> str:
-    """<a href="../../../venue/newcastle-nx-newcastle-upon-tyne-england-13d055c5.html" title="More setlists from Newcastle NX, Newcastle upon Tyne, England"><span>Newcastle NX, Newcastle upon Tyne, England</span></a>"""
-    return souped.select_one(".setlistHeadline a[href*='/venue/']").text.strip()
+    config = SetlistConfig(
+        public=args.public,
+        verbose=args.verbose,
+        input_file=args.file
+    )
 
-def convert(links: list[str]):
-    for link in links:
-        artist = slug_to_plain(link.split("setlist.fm/setlist/")[1].split("/")[0])
-        content = requests.get(link).content
-        souped = BeautifulSoup(content, "html.parser")
-        setlist_date = get_date_of_setlist(souped)
-        print("Setlist date:", setlist_date)
-        venue = get_venue(souped)
-        if is_empty_setlist(souped):
-            print(f"Setlist for {artist} on {setlist_date} is empty, ignoring...")
-            continue
-        song_labels = get_song_labels(souped).split("\n")
-        print("Song labels:", song_labels)
-        song_links = list(filter(bool, (get_song_link(artist, label) for label in song_labels if label is not None)))
-        print("Song links:", song_links)
-        playlist_name = f"{artist} - {setlist_date} - {venue}".title()
-        playlist_id = create_playlist(playlist_name)
-        add_songs_to_playlist(playlist_id, song_links)
+    converter = SetlistConverter(config)
+    
+    urls = args.urls
+    if args.file:
+        try:
+            with open(args.file) as f:
+                urls.extend(line.strip() for line in f if line.strip())
+        except Exception as e:
+            logger.error(f"Failed to read input file: {e}")
+            sys.exit(1)
+
+    for url in urls:
+        converter.process_setlist(url)
 
 if __name__ == "__main__":
-    convert([
-        "https://www.setlist.fm/setlist/circa-waves/2025/barrowland-glasgow-scotland-2b50ac12.html",
-        "https://www.setlist.fm/setlist/circa-waves/2025/cambridge-junction-cambridge-england-2350ac0b.html",
-        "https://www.setlist.fm/setlist/circa-waves/2025/nick-rayns-lcr-uea-norwich-england-3b50ac00.html",
-        "https://www.setlist.fm/setlist/circa-waves/2025/newcastle-nx-newcastle-upon-tyne-england-3350acf9.html",
-        "https://www.setlist.fm/setlist/circa-waves/2025/o2-victoria-warehouse-manchester-england-3350acf1.html",
-    ])
+    main()
